@@ -1,331 +1,344 @@
+"""Fast, compile-once `eindex` (einops-style tensor indexing).
+
+Drop-in for the original `eindex` (https://www.perfectlynormal.co.uk/blog-eindex): same signature,
+same pattern grammar, same results -- but the pattern is parsed **once** into a closure of native
+torch ops, so calling it in a hot loop costs the same as a hand-written `torch.gather`.
+
+    from eindex import eindex, compile_eindex
+
+    out = eindex(logprobs, labels, "batch seq [batch seq]")   # drop-in; pattern compiled once + cached
+    pick = compile_eindex("batch [batch]")                    # or compile explicitly for a hot loop
+    out = pick(arr, idx)
+
+Supported grammar (a superset of the original's):
+  - bare axes (kept in the output)       "batch"
+  - bracketed indexed axes               "[batch seq]"          (each bracket consumes one index tensor)
+  - multiple index tensors               "... [batch seq] [batch seq]"   (1:1 with the brackets)
+  - single tensor, integer-slot brackets "... [batch seq 0] [batch seq 1]"
+  - offsets                              "[batch seq+1]"        (autoregressive; shrinks that axis)
+  - "-> ..." output reorder
+  - numpy arrays in / out (converted at the boundary)
+  - repeated bare axes -> diagonal, e.g. "b s [b s k2] b s [b s k1] -> b s k2 k1" on a (b,s,f,b,s,f)
+    jacobian gives out[b,s,k2,k1] = jac[b,s,oi[b,s,k2],b,s,ii[b,s,k1]]. The original raised on this
+    (github.com/callummcdougall/eindex/issues/4).
+Whether brackets share one index tensor (integer-slot case) or map one-each (multi-tensor case) is
+decided by the number of index tensors passed -- exactly as the original does.
+
+Validation: shape/pattern mismatches raise `EindexError` (a `ValueError` *and* an `AssertionError`, for
+compatibility with the original) with a message in the spirit of the original. It uses only Python-int
+comparisons (no `.item()` device syncs), so the closures stay `torch.compile(fullgraph=True)`-clean and
+the check costs ~3 us per call.
+
+Why the original is ~30-50x slower (profiled on CPU, "batch [batch]", B=4096): not the regex parse
+(~3 us) but the `torch.tensor(shape).prod().item()` device-sync asserts, unconditional error-string
+building per axis, and indexing with a Python *list* (`arr[full_idx]` -- torch's slow, deprecated
+non-tuple path: ~450 us vs ~30 us for `gather`).
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Callable, Union
+
 import numpy as np
-import re
 import torch
-from typing import Union, List, overload
-import einops
+from torch import Tensor
 
-Arr = np.ndarray
-
-from ._parsing import parse_string
-from ._utils import label_dimension, check_dimension_compatability
-
-# Type signature: eindex supports having first argument be a tensor and subsequent array arguments being either tensors
-# or numpy arrays (because we can index into a tensor with a numpy array). The last argument must be a string.
-
-@overload
-def eindex(
-    *tensors_and_pattern: Union[str, Arr],
-    **kwargs,
-) -> Arr:
-    ...
-
-@overload
-def eindex(
-    first_tensor: torch.Tensor,
-    *tensors_and_pattern: Union[str, Arr, torch.Tensor],
-    **kwargs,
-) -> torch.Tensor:
-    ...
-
-def eindex(
-    *tensors_and_pattern: Union[str, Union[Arr, torch.Tensor]],
-    **kwargs,
-) -> Union[Arr, torch.Tensor]:
-    '''
-    Indexing inspired by einops notation: https://einops.rocks/
-
-    See colab for test cases: 
-
-    
-    ==========================================================================================
-    ======================================== EXAMPLES ========================================
-    ==========================================================================================
-
-    I've given 5 examples here. Most of the code below is annotated with explanations relating it
-    to one or more of these examples, to help explain what's going on.
-
-    Some examples:
-
-        # (1) You want to get all the logprobs for correct tokens
-
-            output[batch, seq] = logrobs[batch, seq, labels[batch, seq]]
-
-            pattern = "batch seq [batch seq]"
-
-        # (2a) Same, but d_vocab_out is 2D not 1D for some reason
-            
-            output[batch, seq] = logrobs[batch, seq, labels[batch, seq, 0], labels[batch, seq, 1]]
-
-            pattern = "batch seq [batch seq 0] [batch seq 1]"
-        
-        # (2b) Using 2 tensors
-            
-            output[batch, seq] = logrobs[batch, seq, labels_1[batch, seq], labels_2[batch, seq]]
-
-            pattern = "batch seq [batch seq] [batch seq]"
-
-        # (3) You want to get the logit lens at particular sequence positions (a different seq pos
-              for each sequence in the batch)
-        
-            output[batch, d_vocab] = logprobs[batch, labels[batch], d_vocab]
-            
-            pattern = "batch [batch] d_vocab"
-
-        # (4) You're indexing into a 2D tensor of tokens, for each destination token you're trying to get 5 source tokens
-              (i.e. indices[batch, seqQ, :] = the seqK positions of the top 5 source tokens)
-        
-            output[batch, seqQ, k] = tokens[batch, indices[batch, seqQ, k]]
-
-            pattern = "batch [batch seqQ k]"
-
-        # (5) Same as (1), except you're producing an array of shape (batch, seq-1) cause this is before slicing.
-
-            output[batch, seq] = logrobs[batch, seq, labels[batch, seq+1]]
-
-            pattern = "batch seq [batch seq+1]"
-
-        # (6) If we want to rearrange the output, we can append -> onto the end. Functionally, this just adds an einops
-              rearrange operation. It's only necessary when the order of appearance of the dimensions in the pattern
-              doesn't match what you want the final shape to be.
-
-            output[seq, batch] = logrobs[batch, seq, labels[batch, seq]]
-
-            pattern = "batch seq [batch seq] -> seq batch"
-
-            
-    ==========================================================================================
-    ======================== ROUGH SUMMARY OF HOW THIS FUNCTION WORKS ========================
-    ==========================================================================================
-
-    This is implemented explicitly, i.e. with no built-in PyTorch functions like `gather` (cause they confuse me lol). 
-    For example, the way we implement (1) is by creating an index like this:
-    
-        logprobs[
-            torch.arange(batch_size).reshape(batch_size, 1),
-            torch.arange(seq_len).reshape(1, seq_len),
-            labels
-        ]
-
-    because when you index with tensors across different dimensions, they're all implicitly broadcast together. So we get:
-
-        output[b, s] = logprobs[
-            torch.arange(batch_size).reshape(batch_size, seq_len)[b, s],
-            torch.arange(seq_len).reshape(batch_size, seq_len)[b, s],
-            labels[b, s]
-        ] = logprobs[b, s, labels[b, s]]
-
-    You can use `verbose=True` to print out the dimensions of the shape you'll get at the end.
-    '''
-
-    # Unpack and type-check arguments
-    arr, *index_tensor_list, pattern = tensors_and_pattern
-    verbose = kwargs.pop("verbose", False)
-    assert len(kwargs) == 0, f"Unexpected keyword arguments: {kwargs.keys()}"
-    assert isinstance(pattern, str), "Last argument must be a string."
-    
-    # If numpy, convert to torch tensors
-    # NOTE: remember the original type so we can convert back at the end
-    orig_is_numpy: bool = isinstance(arr, np.ndarray)
-    arr = torch.from_numpy(arr) if orig_is_numpy else arr
-    index_tensor_list = [torch.from_numpy(i) if isinstance(i, np.ndarray) else i for i in index_tensor_list]
-
-    # Parse the pattern string into a list of dimension names (and a list of offsets, if they exist)
-    #   Example #1:  ['batch', 'seq', ['batch', 'seq']] and [0, 0, [0, 0]]
-    #   Example #2a: ['batch', 'seq', ['batch', 'seq', '0'], ['batch', 'seq', '1']] and [0, 0, [0, 0], [0, 0]]
-    #   Example #5: ['batch', 'seq', ['batch', 'seq+1']] and [0, 0, [0, 1]]
-    pattern_indices, pattern_offsets, einops_operation = parse_string(pattern)
-    pattern_indices_str: List[str] = [p for p in pattern_indices if isinstance(p, str)]
-
-    # Check the dimensions are appropriate
-    assert len(pattern_indices) == arr.ndim, "Invalid indices.\n" + \
-        f"Number of terms in your string pattern = {len(pattern_indices)}\n" + \
-        f"Number of terms in your array to index into = {arr.ndim}\n" + \
-        "These should match."
-
-    # Check whether you're doing #2a (using a single index with multiple slices) or #2b (using multiple indices), but not both!
-    using_multiple_indices = len(index_tensor_list) > 1
-    using_multiple_slices = any((isinstance(i, list) and any(j.isdigit() for j in i)) for i in pattern_indices)
-    assert not (using_multiple_indices and using_multiple_slices), "You can't use both multiple indices and multiple slices. Choose one or the other."
-
-    # Create a dicionary mapping names of dimensions to their sizes (purely based on the things that appear in square brackets)
-    #   Example #1: ['batch', 'seq', ['batch', 'seq']] -> {'batch': batch_size, 'seq': seq_len}
-    #   Example #4: ['batch', ['batch', 'seq', 'k']] -> {'batch': batch_size, 'seq': seq_len, 'k': k}
-    output_dim_counter = 0
-    index_tensor_counter = 0
-    pattern_and_dimensions_string = pattern # if we have incompatible dims, this will get printed out
-    dimension_sizes = {}
-    dimension_offset_sizes = {}
-    for item, item_offset in zip(pattern_indices, pattern_offsets):
-
-        # If the item is a string, we just add a single dimension: that of `arr`
-        if isinstance(item, str):
-            dimension_size = arr.shape[output_dim_counter]
-            pattern_and_dimensions_string = label_dimension(pattern_and_dimensions_string, item, dimension_size)
-            dimension_sizes[item] = dimension_size
-            dimension_offset_sizes[item] = max(dimension_offset_sizes.get(item, 0), item_offset)
-
-        # If the item is a list, we add multiple dimensions: all those of the appropriate index tensor
-        elif isinstance(item, list):
-            # Check this square brackets expression matches the indexing tensor that it corresponds to
-            assert len(item) == len(index_tensor_list[index_tensor_counter].shape), \
-                "Invalid indices. There should be as many terms in each square brackets expression as the corresponding indexing tensor has dimensions." + \
-                f"\nSquare brackets expression: {item}" + \
-                f"\nIndexing tensor shape: {index_tensor_list[index_tensor_counter].shape}"
-            # Once you've asserted that it does, add the dimension sizes to the dictionary (checking for contradictions)
-            for dimension_name, dimension_offset, dimension_size in zip(item, item_offset, index_tensor_list[index_tensor_counter].shape):
-                pattern_and_dimensions_string = label_dimension(pattern_and_dimensions_string, dimension_name, dimension_size)
-                if not dimension_name.isdigit():
-                    dimension_sizes[dimension_name] = dimension_size
-                    dimension_offset_sizes[dimension_name] = max(dimension_offset_sizes.get(dimension_name, 0), dimension_offset)
-            # If >1 index tensor is being used (e.g. #2b), increment the counter so we compare the next square brackets expression to the right indexing tensor
-            if using_multiple_indices:
-                index_tensor_counter += 1
-        
-        output_dim_counter += 1
-
-    # Once we've labelled everything, check if there are any errors
-    check_dimension_compatability(pattern_and_dimensions_string, dimension_sizes.keys())
-    if verbose:
-        print("Dimension sizes:\n  " + "\n  ".join([f"{k}: {v}" for k, v in dimension_sizes.items()]))
+Array = Union[Tensor, np.ndarray]
 
 
-    # Get dimensions of output, so we know what to broadcast our indices to (when they're strings). This is all the string expressions (added the first time 
-    # they appear), plus the terms in square brackets which don't also appear in string expressions (e.g. as in #4).
-    #   Example #1: ['batch', 'seq', ['batch', 'seq']] -> ['batch', 'seq']
-    #   Example #4: ['batch', ['batch', 'seq', 'k']] -> ['batch', 'seq', 'k']
-    #   Example #5: ['batch', 'seq', ['batch', 'seq+1']] -> ['batch', 'seq'], and the output_shape will be (batch, seq-1) not (batch, seq)
-    output_dims = []
-    output_shape = []
-    for item in pattern_indices:
-        if isinstance(item, str):
-            dimension_name = item
-            output_dims.append(dimension_name)
-            output_shape.append(dimension_sizes[dimension_name] - dimension_offset_sizes[dimension_name])
-        elif isinstance(item, list):
-            for dimension_name in item:
-                if (dimension_name not in pattern_indices_str) and (dimension_name not in output_dims) and not(dimension_name.isdigit()):
-                    output_dims.append(dimension_name)
-                    output_shape.append(dimension_sizes[dimension_name] - dimension_offset_sizes[dimension_name])
-    output_shape = tuple(output_shape)
-    output_ndim = len(output_shape)
-
-    # Start constructing the index `full_idx`, by appending t.arange objects or tensors to it
-    # Note, to avoid confusion:
-    # - `full_idx` is the object we'll eventually use to index into our array, i.e. the first argument of `eindex`
-    # - `idx` are the objects we construct to index into our indexing arrays. Usually `idx` is just "take the entire indexing array", but this isn't
-    #   always the case, e.g. when the pattern string looks like [batch seq+1] (see example #5) or [batch seq 0] (see example #2a).
-    index_tensor_counter = 0
-    full_idx = []
-    for (item, item_offset, dimemsion_size) in zip(pattern_indices, pattern_offsets, arr.shape):
+class EindexError(ValueError, AssertionError):
+    """Raised on a pattern / shape mismatch. Subclasses `AssertionError` too, because the original
+    `eindex` raised `AssertionError` and existing code (e.g. `demo.ipynb`) catches that."""
 
 
-        # ! If item in pattern string is just a str, we put a rearranged indices tensor here so it can broadcast with the index tensors
-        #   Example #1: 'batch' -> torch.arange(batch_size).reshape(batch_size, 1)
-        #   Example #1: 'seq'   -> torch.arange(seq_len).reshape(1, seq_len)
-        #   Example #4: 'batch' -> torch.arange(batch_size).reshape(batch_size, 1, 1)
-        #   Example #5: 'seq'   -> torch.arange(seq_len).reshape(1, seq_len-1), because this is the output shape (dim size minus dim offset size)
-        
-        if isinstance(item, str):
-            dimension_name = item
+# ---------------------------------------------------------------------------------------------------
+# Pattern parsing (done once per pattern, in `compile_eindex`)
+# ---------------------------------------------------------------------------------------------------
 
-            # True dimension size accounts for offsets, e.g. with #5 [batch seq [batch seq+1]] the output size will be (batch, seq-1)
-            true_dimemsion_size = dimemsion_size - dimension_offset_sizes[dimension_name]
 
-            # We want our shape to be [1, 1, ..., dim_size, ..., 1, 1], with the values being the range (0, 1, ..., dim_size-1)
-            shape = [1] * output_ndim
-            shape[output_dims.index(dimension_name)] = true_dimemsion_size
-            
-            # Check the shape isn't unexpected (we should have only one element of the above tensor not equal to 1)
-            assert torch.tensor(shape).prod().item() == true_dimemsion_size, \
-                "Something's gone wrong with the shape broadcasting. Please submit an issue at https://github.com/callummcdougall/eindex"
-
-            # ! Append the broadcasted torch.arange object to the full list of indices
-            full_idx_item = torch.arange(true_dimemsion_size).reshape(*shape)
-            full_idx.append(full_idx_item)
-        
-
-        # ! If item is a list, this means we should be indexing into the corresponding index tensor
-        # i.e. we need to construct `idx` and `shape` s.t. index_tensor[idx].reshape(shape) is the thing we want to append to the `full_idx` list
-        #   Example #1:  ['batch', 'seq']      -> we want indices[:, :]
-        #   Example #2a: ['batch', 'seq', '0'] -> we want indices[:, :, 0]
-        #   Example #3:  ['batch']             -> we want indices[:].reshape(batch_size, 1) so it broadcasts with the final output shape
-        #   Example #5:  ['batch' 'seq']       -> we want indices[:, 1:seq_len] because the seq offset is +1
-        
-        elif isinstance(item, list):
-        
-            # Get the correct indices tensor, and increment the counter if we're using multiple indices
-            index_tensor = index_tensor_list[index_tensor_counter]
-            if using_multiple_indices:
-                index_tensor_counter += 1
-        
-            # Get `idx` we'll be using to index into our indexing tensor
-            # For each object in `item`, there are 3 cases:
-            #   (A) digit case, i.e. we're dealing with something like [batch seq 0]. Here, we want to index into the index tensor with a single integer.
-            #   (B) vanilla case, e.g. something like [batch seq]. Here, we want to slice the entire tensor.
-            #   (C) offset case, e.g. something like [batch seq+1]. Here, we want to slice the entire tensor but with an offset. The offset is determined
-            #       by the size of the offset on this item (i.e. seq+1) and the maximum offset. For example, if we have [batch seq] [batch seq+1] then we
-            #       would want our slices to be [:, :seq_len-1] and [:, 1:seq_len] respectively.
-            # Note that (B) is a special case of (C), so we don't deal with (B) separately.
-            idx = []
-            for dimension_name, offset in zip(item, item_offset):
-                # Case (B)
-                if dimension_name.isdigit():
-                    idx.append(int(dimension_name))
-                # Case (C)
-                else:
-                    lower = offset
-                    upper = (offset - dimension_offset_sizes[dimension_name]) if (offset != dimension_offset_sizes[dimension_name]) else None
-                    idx.append(slice(lower, upper))
-        
-            # Get `shape` we'll be using to broadcast our tensor back out to the shape of final output. This is necessary if the indexing
-            # tensor has fewer dims than the final output, e.g. Example #3. We do this by taking the output shape, and replacing the elements
-            # with 1s if they're not dimensions that already exist in `index_tensor[idx]`.
-            shape = list(output_shape)
-            for dim_idx, dim_name in enumerate(output_dims):
-                if dim_name not in item:
-                    shape[dim_idx] = 1
-            
-            # Check the shape isn't unexpected (by comparing it to the shape of the index tensor)
-            assert torch.tensor(shape).prod().item() == index_tensor[idx].numel(), \
-                "Something's gone wrong with the shape broadcasting. Please submit an issue at https://github.com/callummcdougall/eindex"
-            
-            # ! Append the reshaped index tensor to the full list of indices
-            full_idx_item = index_tensor[idx].reshape(*shape)
-            full_idx.append(full_idx_item )
-
-    # Index using the full array
-    arr_indexed = arr[full_idx]
-
-    # If there was an einops operation, apply it
-    if einops_operation is not None:
-        einops_dims = einops_operation.split(" ")
-        if einops_dims == output_dims:
-            # In this case, the output dimensions are already correct, and we don't need an einops operation
-            pass
+def _split_axes(lhs: str) -> list[str]:
+    """'batch seq [batch seq]' -> ['batch', 'seq', '[batch seq]'] (bracket-aware split on spaces)."""
+    parts, buf, depth = [], "", 0
+    for ch in lhs.strip():
+        if ch == "[":
+            depth += 1
+            buf += ch
+        elif ch == "]":
+            depth -= 1
+            buf += ch
+        elif ch == " " and depth == 0:
+            if buf:
+                parts.append(buf)
+                buf = ""
         else:
-            assert set(einops_dims) == set(output_dims), \
-                "The dimensions in your einops operation, i.e. the part after '->', don't match the inferred output dimensions of your indexing operation." + \
-                f"\nInferred output dimensions: {output_dims}" + \
-                f"\nYour einops operation: {einops_dims}"
-            einops_operation = f"{' '.join(output_dims)} -> {einops_operation}"
-            arr_indexed = einops.rearrange(arr_indexed, einops_operation)
-
-    if orig_is_numpy:
-        arr_indexed = arr_indexed.numpy()
-
-    return arr_indexed
+            buf += ch
+    if buf:
+        parts.append(buf)
+    if depth != 0:
+        raise EindexError(f"Unbalanced brackets in pattern {lhs!r}")
+    return parts
 
 
-# BATCH_SIZE = 32
-# SEQ_LEN = 5
-# D_VOCAB = 100
+def _parse_entry(tok: str) -> tuple[str, int, bool]:
+    """'seq' -> ('seq', 0, False); 'seq+1' -> ('seq', 1, False); '0' -> ('0', 0, True) (integer slot)."""
+    if tok.isdigit():
+        return (tok, 0, True)
+    name, _, off = tok.partition("+")
+    if not name or (off and not off.isdigit()):
+        raise EindexError(f"Bad axis token {tok!r} (expected 'name', 'name+k' or an integer slot)")
+    return (name, int(off) if off else 0, False)
 
-# logprobs = t.randn(BATCH_SIZE, SEQ_LEN, D_VOCAB).log_softmax(-1)
-# labels = t.randint(0, D_VOCAB, (BATCH_SIZE, SEQ_LEN))
 
-# output_1A = eindex(logprobs, labels, "batch seq [batch seq]")
-# output_1B = eindex(logprobs, labels, "batch seq [batch seq] -> batch seq")
-# output_2 = eindex(logprobs, labels, "batch seq [batch seq] -> seq batch")
+def _np_wrap(run: Callable) -> Callable:
+    """Allow numpy arrays in/out (convert at the boundary), like the original."""
 
-# assert t.allclose(output_1A, output_2.T)
-# assert t.allclose(output_1B, output_2.T)
+    def f(arr: Array, *idx: Array) -> Array:
+        np_in = isinstance(arr, np.ndarray)
+        a = torch.as_tensor(arr) if np_in else arr
+        ii = [torch.as_tensor(x) if isinstance(x, np.ndarray) else x for x in idx]
+        out = run(a, *ii)
+        return out.numpy() if np_in else out
+
+    return f
+
+
+# ---------------------------------------------------------------------------------------------------
+# Compiler
+# ---------------------------------------------------------------------------------------------------
+
+
+def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -> Callable:
+    """Parse `pattern` once; return `f(arr, *index_tensors)` that indexes `arr` with no re-parsing.
+
+    verbose=True prints the inferred per-axis sizes and output shape on each call (like the original's
+    `verbose`); it bypasses the gather fast path so the sizes are available to print.
+    validate=False skips the (cheap, shape-only) argument checks; errors then surface as raw torch
+    indexing errors.
+    """
+    lhs, arrow, rhs = pattern.partition("->")
+    if arrow and not rhs.strip():
+        raise EindexError(f"Pattern {pattern!r} has '->' but nothing after it")
+
+    # per arr-axis token: ("bare", name, offset) | ("idx", [(name, offset, is_digit), ...], bracket_i)
+    axis_tokens: list[tuple] = []
+    n_brackets = 0
+    for part in _split_axes(lhs):
+        if part.startswith("["):
+            entries = [_parse_entry(t) for t in part[1:-1].split()]
+            if not entries:
+                raise EindexError(f"Empty brackets in pattern {pattern!r}")
+            axis_tokens.append(("idx", entries, n_brackets))
+            n_brackets += 1
+        else:
+            name, offset, _ = _parse_entry(part)
+            axis_tokens.append(("bare", name, offset))
+    if n_brackets == 0:
+        raise EindexError(f"Pattern {pattern!r} has no [indexed] axes -- nothing to index")
+    n_arr_axes = len(axis_tokens)
+
+    def _entries(tok):
+        return [(tok[1], tok[2], False)] if tok[0] == "bare" else tok[1]
+
+    # max offset per name -> how much that output axis shrinks
+    offset_size: dict[str, int] = {}
+    for tok in axis_tokens:
+        for name, off, is_digit in _entries(tok):
+            if not is_digit:
+                offset_size[name] = max(offset_size.get(name, 0), off)
+
+    inferred_axes: list[str] = []
+    for tok in axis_tokens:
+        for name, _off, is_digit in _entries(tok):
+            if not is_digit and name not in inferred_axes:
+                inferred_axes.append(name)
+    if rhs.strip():
+        out_axes = rhs.split()
+        if sorted(out_axes) != sorted(inferred_axes):
+            raise EindexError(
+                "The dimensions after '->' don't match the inferred output dimensions of your indexing operation."
+                f"\nInferred output dimensions: {inferred_axes}\nYour '->' dimensions: {out_axes}"
+            )
+    else:
+        out_axes = inferred_axes
+    out_pos = {nm: k for k, nm in enumerate(out_axes)}
+    nout = len(out_axes)
+    has_offset = any(v > 0 for v in offset_size.values())
+    has_digit = any(tok[0] == "idx" and any(e[2] for e in tok[1]) for tok in axis_tokens)
+
+    idx_axes = [ax for ax, tok in enumerate(axis_tokens) if tok[0] == "idx"]
+    bare_names = [tok[1] for tok in axis_tokens if tok[0] == "bare"]
+
+    # (bracket_i, entry_pos, name, is_digit) for every bracket entry: used by the shape checks
+    bracket_shapes = [(tok[2], len(tok[1])) for tok in axis_tokens if tok[0] == "idx"]
+
+    def _check(arr: Tensor, idx_tensors: tuple) -> None:
+        """Cheap shape-only validation (Python ints only; no device syncs)."""
+        if arr.ndim != n_arr_axes:
+            raise EindexError(
+                f"Invalid indices: pattern {pattern!r} has {n_arr_axes} terms but the array to index into has "
+                f"{arr.ndim} dimensions (shape {tuple(arr.shape)})."
+            )
+        n_idx = len(idx_tensors)
+        if n_idx == 0:
+            raise EindexError("You need to pass at least one index tensor.")
+        if n_idx != 1 and n_idx != n_brackets:
+            raise EindexError(
+                f"Pattern {pattern!r} has {n_brackets} bracketed groups but you passed {n_idx} index tensors "
+                "(pass one tensor per group, or a single shared tensor with integer slots)."
+            )
+        if n_idx == 1 and n_brackets > 1 and not has_digit:
+            raise EindexError(
+                f"Pattern {pattern!r} has {n_brackets} bracketed groups but only one index tensor was passed; "
+                "either pass one tensor per group, or use integer slots like '[batch seq 0] [batch seq 1]'."
+            )
+        multi = n_idx > 1
+        for bi, n_entries in bracket_shapes:
+            t = idx_tensors[bi if multi else 0]
+            if t.ndim != n_entries:
+                raise EindexError(
+                    f"Bracket #{bi} in pattern {pattern!r} has {n_entries} terms but the corresponding index "
+                    f"tensor has {t.ndim} dimensions (shape {tuple(t.shape)})."
+                )
+        size: dict[str, int] = {}
+        for ax, tok in enumerate(axis_tokens):
+            if tok[0] == "bare":
+                pairs = ((tok[1], arr.shape[ax]),)
+            else:
+                t = idx_tensors[tok[2] if multi else 0]
+                pairs = tuple((e[0], t.shape[p]) for p, e in enumerate(tok[1]) if not e[2])
+            for name, n in pairs:
+                prev = size.setdefault(name, n)
+                if prev != n:
+                    raise EindexError(
+                        f"Contradictory sizes for dimension {name!r} in pattern {pattern!r}: got {prev} and {n} "
+                        f"(array shape {tuple(arr.shape)}, index shapes {[tuple(t.shape) for t in idx_tensors]})."
+                    )
+        if has_digit:
+            t = idx_tensors[0]
+            for tok in axis_tokens:
+                if tok[0] == "idx":
+                    for p, (name, _o, is_digit) in enumerate(tok[1]):
+                        if is_digit and int(name) >= t.shape[p]:
+                            raise EindexError(
+                                f"Integer slot {name} in pattern {pattern!r} is out of range for index tensor axis "
+                                f"{p} of size {t.shape[p]}."
+                            )
+
+    # Fast path: one bracket, no integer slots, no verbose, and both the bare axes and the bracket's
+    # names are exactly the output axes -> a plain torch.gather along the bracket axis. Offsets in the
+    # bracket ("[batch seq+1]") are handled by slicing views of `arr` / `idx` first, so this still
+    # costs one gather (this is the next-token-logprob pattern, which sits in training loops).
+    bare_offsets_zero = all(tok[2] == 0 for tok in axis_tokens if tok[0] == "bare")
+    if (
+        n_brackets == 1
+        and not has_digit
+        and not verbose
+        and bare_offsets_zero
+        and bare_names == out_axes
+        and [e[0] for e in axis_tokens[idx_axes[0]][1]] == out_axes
+    ):
+        gather_dim = idx_axes[0]
+        # arr: shrink each bare axis whose name carries an offset (slice 0 : size-m); idx: slice each
+        # axis `off : off-m` (None when off == m). Built once here; `slice(0, None)` is a no-op view.
+        arr_sl = tuple(
+            slice(0, -offset_size[tok[1]] if tok[0] == "bare" and offset_size.get(tok[1], 0) else None)
+            for tok in axis_tokens
+        )
+        idx_sl = tuple(
+            slice(off, (off - offset_size[name]) if off != offset_size[name] else None)
+            for name, off, _d in axis_tokens[gather_dim][1]
+        )
+        if not has_offset:
+            arr_sl = idx_sl = None
+
+        def _gather(arr: Tensor, idx: Tensor) -> Tensor:
+            if arr_sl is not None:
+                arr, idx = arr[arr_sl], idx[idx_sl]
+            return arr.gather(gather_dim, idx.unsqueeze(gather_dim)).squeeze(gather_dim)
+
+        if validate:
+
+            def run(arr: Tensor, *idx: Tensor) -> Tensor:
+                _check(arr, idx)
+                return _gather(arr, idx[0])
+
+        else:
+
+            def run(arr: Tensor, idx: Tensor) -> Tensor:
+                return _gather(arr, idx)
+
+        return _np_wrap(run)
+
+    def run(arr: Tensor, *idx_tensors: Tensor) -> Tensor:
+        if validate:
+            _check(arr, idx_tensors)
+        multi = len(idx_tensors) > 1  # one tensor per bracket vs one shared tensor with integer slots
+        size: dict[str, int] = {}
+        for ax, tok in enumerate(axis_tokens):
+            if tok[0] == "bare":
+                size[tok[1]] = arr.shape[ax]
+            else:
+                t = idx_tensors[tok[2] if multi else 0]
+                for pos, (name, _off, is_digit) in enumerate(tok[1]):
+                    if not is_digit:
+                        size[name] = t.shape[pos]
+        true = {nm: size[nm] - offset_size.get(nm, 0) for nm in out_axes}
+        if verbose:
+            print(
+                f"eindex {pattern!r}: sizes "
+                + ", ".join(f"{nm}={size[nm]}" for nm in out_axes)
+                + " | output shape "
+                + str(tuple(true[nm] for nm in out_axes))
+            )
+        index_arrays = []
+        for ax, tok in enumerate(axis_tokens):
+            if tok[0] == "bare":
+                p = out_pos[tok[1]]
+                shp = [true[tok[1]] if j == p else 1 for j in range(nout)]
+                index_arrays.append(torch.arange(true[tok[1]], device=arr.device).reshape(shp))
+            else:
+                t = idx_tensors[tok[2] if multi else 0]
+                sl: list = []  # slice / int per index-tensor axis
+                for name, off, is_digit in tok[1]:
+                    if is_digit:
+                        sl.append(int(name))
+                    else:
+                        os_ = offset_size.get(name, 0)
+                        sl.append(slice(off, (off - os_) if off != os_ else None))
+                sub = t[tuple(sl)]  # axes = the bracket's non-digit names, in order
+                names = [e[0] for e in tok[1] if not e[2]]
+                perm = sorted(range(len(names)), key=lambda k: out_pos[names[k]])
+                pos2size = {out_pos[nm]: true[nm] for nm in names}
+                shp = [pos2size.get(j, 1) for j in range(nout)]
+                index_arrays.append(sub.permute(perm).reshape(shp))
+        return arr[tuple(index_arrays)]
+
+    return _np_wrap(run)
+
+
+@lru_cache(maxsize=None)
+def _compiled(pattern: str) -> Callable:
+    return compile_eindex(pattern)
+
+
+def eindex(*tensors_and_pattern, **kwargs) -> Array:
+    """`eindex(arr, *index_tensors, pattern, verbose=False)` -- einops-style indexing.
+
+    Same call signature as the original `eindex`. The pattern is compiled once (see `compile_eindex`)
+    and cached, so repeated calls with the same pattern pay no parse cost.
+
+    Example: `eindex(logprobs, labels, "batch seq [batch seq]")` is
+             `output[b, s] = logprobs[b, s, labels[b, s]]`.
+    """
+    verbose = kwargs.pop("verbose", False)
+    if kwargs:
+        raise TypeError(f"Unexpected keyword arguments: {list(kwargs)}")
+    if len(tensors_and_pattern) < 3:
+        raise TypeError("eindex needs at least an array, one index tensor, and a pattern string.")
+    *tensors, pattern = tensors_and_pattern
+    if not isinstance(pattern, str):
+        raise TypeError("Last argument must be the pattern string.")
+    arr, *index_tensors = tensors
+    fn = compile_eindex(pattern, verbose=True) if verbose else _compiled(pattern)
+    return fn(arr, *index_tensors)
