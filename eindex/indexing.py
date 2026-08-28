@@ -282,6 +282,8 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
             arr_sl = idx_sl = None
 
         def _gather(arr: Tensor, idx: Tensor) -> Tensor:
+            if idx.device != arr.device:  # advanced indexing (the original) accepts a CPU index on a CUDA array
+                idx = idx.to(arr.device)  # gather does not; keep that behaviour (no-op when they already match)
             if arr_sl is not None:
                 arr, idx = arr[arr_sl], idx[idx_sl]
             return arr.gather(gather_dim, idx.unsqueeze(gather_dim)).squeeze(gather_dim)

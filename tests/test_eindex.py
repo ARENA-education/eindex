@@ -320,3 +320,17 @@ def test_whitespace_in_pattern():
     ]
     for p in patterns:
         assert _same(eindex(lp, lab, p), ref), repr(p)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cpu_index_on_cuda_array_like_original():
+    # [1.5.3] OthelloGPT indexes CUDA probe logprobs with a CPU `state` tensor; the original accepts this
+    # (advanced indexing moves the index), so both paths here must too.
+    lp, lab = _rn(4, 6, 7).cuda(), _ri(7, (4, 6))
+    out = eindex(lp, lab, "b s [b s]")  # gather fast path
+    assert out.device == lp.device and torch.equal(out.cpu(), ref_eindex(lp, lab, "b s [b s]").cpu())
+    lp2, l1, l2 = _rn(4, 6, 7, 8).cuda(), _ri(7, (4, 6)), _ri(8, (4, 6))
+    out2 = eindex(lp2, l1, l2, "b s [b s] [b s]")  # generic path
+    assert out2.device == lp2.device and torch.equal(out2.cpu(), ref_eindex(lp2, l1, l2, "b s [b s] [b s]").cpu())
+    out3 = eindex(lp, lab, "b s [b s+1]")  # offset fast path
+    assert torch.equal(out3.cpu(), ref_eindex(lp, lab, "b s [b s+1]").cpu())
