@@ -51,7 +51,7 @@ the inferred axis sizes and output shape.
 **Speed.** The original re-parsed and re-validated the pattern string on every call, ran
 `torch.tensor(shape).prod().item()` device-sync asserts, and indexed with a Python *list* (torch's slow,
 deprecated non-tuple path). `eindex` here compiles each pattern once into a closure of native torch ops
-(a plain `torch.gather` for single-bracket patterns, a broadcast tuple index otherwise) and caches it.
+(a plain `torch.gather` for single-bracket patterns, a broadcast tuple index otherwise) and caches it; the shape-dependent bookkeeping is then cached per shape, the way `einops` caches its reshape plans.
 Measured on the two call sites that sit inside ARENA training loops, µs per call:
 
 | | `"env time [env time] -> env time"` on `(4, 128, 2)` — CPU | same — CUDA (A40) | `"b s [b s+1]"` on real GPT-2-small logits `(3, 402, 50257)` — CUDA |
