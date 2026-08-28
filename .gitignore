@@ -3,3 +3,5 @@ build
 dist
 *.egg-info/
 instructions.md
+.pytest_cache
+bench/*.png
