@@ -58,7 +58,7 @@ class EindexError(ValueError, AssertionError):
 
 
 def _split_axes(lhs: str) -> list[str]:
-    """'batch seq [batch seq]' -> ['batch', 'seq', '[batch seq]'] (bracket-aware split on spaces)."""
+    """'batch seq [batch seq]' -> ['batch', 'seq', '[batch seq]'] (bracket-aware split on whitespace)."""
     parts, buf, depth = [], "", 0
     for ch in lhs.strip():
         if ch == "[":
@@ -67,7 +67,7 @@ def _split_axes(lhs: str) -> list[str]:
         elif ch == "]":
             depth -= 1
             buf += ch
-        elif ch == " " and depth == 0:
+        elif ch.isspace() and depth == 0:
             if buf:
                 parts.append(buf)
                 buf = ""
@@ -172,6 +172,18 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
     # (bracket_i, entry_pos, name, is_digit) for every bracket entry: used by the shape checks
     bracket_shapes = [(tok[2], len(tok[1])) for tok in axis_tokens if tok[0] == "idx"]
 
+    def _inferred(arr: Tensor, idx_tensors: tuple) -> str:
+        multi = len(idx_tensors) > 1
+        parts = []
+        for ax, tok in enumerate(axis_tokens):
+            if tok[0] == "bare":
+                parts.append(f"{tok[1]}={arr.shape[ax]}")
+            else:
+                t = idx_tensors[tok[2] if multi else 0]
+                inner = " ".join(e[0] if e[2] else f"{e[0]}={t.shape[p]}" for p, e in enumerate(tok[1]))
+                parts.append(f"[{inner}]")
+        return " ".join(parts)
+
     validated: set = set()  # shape signatures already checked: a loop with fixed shapes validates once
 
     def _check(arr: Tensor, idx_tensors: tuple) -> None:
@@ -201,11 +213,6 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
                 f"Pattern {pattern!r} has {n_brackets} bracketed groups but you passed {n_idx} index tensors "
                 "(pass one tensor per group, or a single shared tensor with integer slots)."
             )
-        if n_idx == 1 and n_brackets > 1 and not has_digit:
-            raise EindexError(
-                f"Pattern {pattern!r} has {n_brackets} bracketed groups but only one index tensor was passed; "
-                "either pass one tensor per group, or use integer slots like '[batch seq 0] [batch seq 1]'."
-            )
         multi = n_idx > 1
         for bi, n_entries in bracket_shapes:
             t = idx_tensors[bi if multi else 0]
@@ -225,9 +232,17 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
                 prev = size.setdefault(name, n)
                 if prev != n:
                     raise EindexError(
-                        f"Contradictory sizes for dimension {name!r} in pattern {pattern!r}: got {prev} and {n} "
-                        f"(array shape {tuple(arr.shape)}, index shapes {[tuple(t.shape) for t in idx_tensors]})."
+                        f"Incompatible sizes for {name!r} dimension: got {prev} and {n}.\n"
+                        f"Based on your inputs, the inferred dimension sizes are {_inferred(arr, idx_tensors)!r}.\n"
+                        "Note - inputs in square brackets are the shapes of the index tensors, the rest are the shape "
+                        "of the array being indexed."
                     )
+        for name, m in offset_size.items():
+            if m and size[name] <= m:
+                raise EindexError(
+                    f"Offset '{name}+{m}' in pattern {pattern!r} is too large: dimension {name!r} has size "
+                    f"{size[name]}, so there is nothing left after shifting by {m}."
+                )
         if has_digit:
             t = idx_tensors[0]
             for tok in axis_tokens:

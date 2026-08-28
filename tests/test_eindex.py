@@ -218,7 +218,11 @@ def test_verbose():
 BAD_CALLS = {
     "array ndim mismatch": (lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 5)), "batch [batch seq]"), "3 dimensions"),
     "index ndim mismatch": (lambda: eindex(_rn(4, 5, 6), _ri(6, (4,)), "batch seq [batch seq]"), "Bracket #0"),
-    "contradictory sizes": (lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 7)), "batch seq [batch seq]"), "Contradictory"),
+    "contradictory sizes": (lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 7)), "batch seq [batch seq]"), "Incompatible sizes"),
+    "offset too large": (
+        lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 5)), "batch seq [batch seq+5]"),
+        "too large",
+    ),
     "bad -> names": (lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 5)), "batch seq [batch seq] -> batch foo"), "'->'"),
     "too many tensors": (
         lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 5)), _ri(6, (4, 5)), "batch seq [batch seq]"),
@@ -251,7 +255,7 @@ def test_type_errors():
 def test_demo_notebook_error_cells():
     # exactly what demo.ipynb does: catch AssertionError and print the message
     lp, lab = _rn(32, 5, 100), _ri(100, (33, 5))
-    with pytest.raises(AssertionError, match="Contradictory sizes"):
+    with pytest.raises(AssertionError, match="Incompatible sizes"):
         eindex(lp, lab, "batch seq [batch seq]")
     with pytest.raises(AssertionError, match="2 terms"):
         eindex(lp, _ri(100, (32, 5)), "batch [batch seq]")
@@ -271,7 +275,8 @@ def test_generic_path_torch_compile_clean():
     lp, l1, l2 = _rn(4, 5, 6, 6), _ri(6, (4, 5)), _ri(6, (4, 5))
     g = compile_eindex("batch seq [batch seq] [batch seq]")
     assert torch.equal(torch.compile(g, fullgraph=True)(lp, l1, l2), g(lp, l1, l2))
-    jac = _rn(2, 3, 7, 2, 3, 7); oi, ii = _ri(7, (2, 3, 5)), _ri(7, (2, 3, 5))
+    jac = _rn(2, 3, 7, 2, 3, 7)
+    oi, ii = _ri(7, (2, 3, 5)), _ri(7, (2, 3, 5))
     h = compile_eindex("b s [b s k2] b s [b s k1] -> b s k2 k1")
     assert torch.equal(torch.compile(h, fullgraph=True)(jac, oi, ii), h(jac, oi, ii))
 
@@ -283,3 +288,27 @@ def test_generic_path_cuda_matches_cpu():
     cpu = eindex(lp, lab, p)
     assert torch.equal(eindex(lp.cuda(), lab.cuda(), p).cpu(), cpu)
     assert torch.equal(eindex(lp, lab, p), cpu)  # cpu plan still intact after the cuda call
+
+
+def test_error_message_shows_inferred_sizes_like_original():
+    # the original's message: "... inferred dimension sizes are 'batch=32 seq=5 [batch=33 seq=5]'"
+    lp, lab = _rn(32, 5, 100), _ri(100, (33, 5))
+    with pytest.raises(EindexError, match=r"'batch=32 seq=5 \[batch=33 seq=5\]'"):
+        eindex(lp, lab, "batch seq [batch seq]")
+    with pytest.raises(AssertionError, match=r"'batch=32 seq=5 \[batch=33 seq=5\]'"):
+        ref_eindex(lp, lab, "batch seq [batch seq]")
+
+
+def test_one_tensor_shared_across_brackets_like_original():
+    lp, lab = _rn(8, 5, 9, 9), _ri(9, (8, 5))
+    p = "batch seq [batch seq] [batch seq]"
+    assert _same(eindex(lp, lab, p), ref_eindex(lp, lab, p))
+    assert _same(eindex(lp, lab, p), eindex(lp, lab, lab, p))
+
+
+def test_whitespace_in_pattern():
+    lp, lab = _rn(8, 5, 9), _ri(9, (8, 5))
+    ref = ref_eindex(lp, lab, "batch seq [batch seq]")
+    patterns = ["batch  seq [batch seq]", "batch\tseq [batch\tseq]", "  batch seq [batch seq]  ", "batch seq [ batch seq ]"]
+    for p in patterns:
+        assert _same(eindex(lp, lab, p), ref), repr(p)
