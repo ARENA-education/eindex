@@ -27,7 +27,7 @@ decided by the number of index tensors passed -- exactly as the original does.
 Validation: shape/pattern mismatches raise `EindexError` (a `ValueError` *and* an `AssertionError`, for
 compatibility with the original) with a message in the spirit of the original. It uses only Python-int
 comparisons (no `.item()` device syncs), so the closures stay `torch.compile(fullgraph=True)`-clean and
-the check costs ~3 us per call.
+the check runs once per distinct shape signature (memoised), so a fixed-shape loop pays ~0.5 us per call.
 
 Why the original is ~30-50x slower (profiled on CPU, "batch [batch]", B=4096): not the regex parse
 (~3 us) but the `torch.tensor(shape).prod().item()` device-sync asserts, unconditional error-string
@@ -172,8 +172,22 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
     # (bracket_i, entry_pos, name, is_digit) for every bracket entry: used by the shape checks
     bracket_shapes = [(tok[2], len(tok[1])) for tok in axis_tokens if tok[0] == "idx"]
 
+    validated: set = set()  # shape signatures already checked: a loop with fixed shapes validates once
+
     def _check(arr: Tensor, idx_tensors: tuple) -> None:
-        """Cheap shape-only validation (Python ints only; no device syncs)."""
+        """Shape-only validation (Python ints; no device syncs), memoised on the shapes involved."""
+        if len(idx_tensors) == 1:
+            key = (arr.shape, idx_tensors[0].shape)
+        else:
+            key = (arr.shape, *[t.shape for t in idx_tensors])
+        if key in validated:
+            return
+        _check_full(arr, idx_tensors)
+        if len(validated) > 64:  # unbounded growth guard (e.g. a new shape every call)
+            validated.clear()
+        validated.add(key)
+
+    def _check_full(arr: Tensor, idx_tensors: tuple) -> None:
         if arr.ndim != n_arr_axes:
             raise EindexError(
                 f"Invalid indices: pattern {pattern!r} has {n_arr_axes} terms but the array to index into has "
