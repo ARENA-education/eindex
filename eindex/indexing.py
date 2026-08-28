@@ -284,9 +284,12 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
 
         return _np_wrap(run)
 
-    def run(arr: Tensor, *idx_tensors: Tensor) -> Tensor:
-        if validate:
-            _check(arr, idx_tensors)
+    # Generic path (several brackets, integer slots, diagonals, verbose). Like einops'
+    # `_reconstruct_from_shape` cache, everything that depends only on the *shapes* -- the inferred sizes,
+    # the slice/permute/reshape bookkeeping for each index tensor, and the `arange` tensors for the bare
+    # axes -- is computed once per (shapes, device) and reused; per call only the data-dependent
+    # `idx[slices].permute(...).reshape(...)` views and the final index remain.
+    def _make_plan(arr: Tensor, idx_tensors: tuple, device) -> tuple:
         multi = len(idx_tensors) > 1  # one tensor per bracket vs one shared tensor with integer slots
         size: dict[str, int] = {}
         for ax, tok in enumerate(axis_tokens):
@@ -298,21 +301,19 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
                     if not is_digit:
                         size[name] = t.shape[pos]
         true = {nm: size[nm] - offset_size.get(nm, 0) for nm in out_axes}
-        if verbose:
-            print(
-                f"eindex {pattern!r}: sizes "
-                + ", ".join(f"{nm}={size[nm]}" for nm in out_axes)
-                + " | output shape "
-                + str(tuple(true[nm] for nm in out_axes))
-            )
-        index_arrays = []
+        summary = (
+            f"eindex {pattern!r}: sizes "
+            + ", ".join(f"{nm}={size[nm]}" for nm in out_axes)
+            + " | output shape "
+            + str(tuple(true[nm] for nm in out_axes))
+        )
+        steps = []  # per arr-axis: ("arange", tensor) | ("idx", which_tensor, slices, perm, shape)
         for ax, tok in enumerate(axis_tokens):
             if tok[0] == "bare":
                 p = out_pos[tok[1]]
                 shp = [true[tok[1]] if j == p else 1 for j in range(nout)]
-                index_arrays.append(torch.arange(true[tok[1]], device=arr.device).reshape(shp))
+                steps.append(("arange", torch.arange(true[tok[1]], device=device).reshape(shp)))
             else:
-                t = idx_tensors[tok[2] if multi else 0]
                 sl: list = []  # slice / int per index-tensor axis
                 for name, off, is_digit in tok[1]:
                     if is_digit:
@@ -320,12 +321,45 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
                     else:
                         os_ = offset_size.get(name, 0)
                         sl.append(slice(off, (off - os_) if off != os_ else None))
-                sub = t[tuple(sl)]  # axes = the bracket's non-digit names, in order
-                names = [e[0] for e in tok[1] if not e[2]]
+                names = [e[0] for e in tok[1] if not e[2]]  # the bracket's non-digit names, in order
                 perm = sorted(range(len(names)), key=lambda k: out_pos[names[k]])
                 pos2size = {out_pos[nm]: true[nm] for nm in names}
                 shp = [pos2size.get(j, 1) for j in range(nout)]
-                index_arrays.append(sub.permute(perm).reshape(shp))
+                # drop the view ops that would be identities (the common case): no slicing, no permute,
+                # and the sliced/permuted shape already equals the broadcast shape
+                sl_t = None if all(x == slice(None) for x in sl) else tuple(sl)
+                perm_t = None if perm == list(range(len(perm))) else perm
+                shp_t = None if [true[names[k]] for k in perm] == shp else shp
+                steps.append(("idx", tok[2] if multi else 0, sl_t, perm_t, shp_t))
+        return steps, summary
+
+    def _index_view(t: Tensor, st: tuple) -> Tensor:
+        if st[2] is not None:
+            t = t[st[2]]
+        if st[3] is not None:
+            t = t.permute(st[3])
+        if st[4] is not None:
+            t = t.reshape(st[4])
+        return t
+
+    plans: dict = {}
+
+    def run(arr: Tensor, *idx_tensors: Tensor) -> Tensor:
+        if validate:
+            _check(arr, idx_tensors)
+        if torch.compiler.is_compiling():  # trace functionally; no cross-call tensor cache in the graph
+            steps, summary = _make_plan(arr, idx_tensors, arr.device)
+        else:
+            key = (arr.shape, *[t.shape for t in idx_tensors], arr.device)
+            plan = plans.get(key)
+            if plan is None:
+                if len(plans) > 64:
+                    plans.clear()
+                plan = plans[key] = _make_plan(arr, idx_tensors, arr.device)
+            steps, summary = plan
+        if verbose:
+            print(summary)
+        index_arrays = [st[1] if st[0] == "arange" else _index_view(idx_tensors[st[1]], st) for st in steps]
         return arr[tuple(index_arrays)]
 
     return _np_wrap(run)

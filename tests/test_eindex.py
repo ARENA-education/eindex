@@ -255,3 +255,31 @@ def test_demo_notebook_error_cells():
         eindex(lp, lab, "batch seq [batch seq]")
     with pytest.raises(AssertionError, match="2 terms"):
         eindex(lp, _ri(100, (32, 5)), "batch [batch seq]")
+
+
+def test_generic_path_plan_cache_and_shape_change():
+    # multi-bracket -> generic path; the per-shape plan must not leak between shapes or devices
+    p = "batch seq [batch seq] [batch seq]"
+    for B, S, V in [(4, 5, 6), (3, 7, 6), (4, 5, 6)]:
+        lp, l1, l2 = _rn(B, S, V, V), _ri(V, (B, S)), _ri(V, (B, S))
+        assert _same(eindex(lp, l1, l2, p), ref_eindex(lp, l1, l2, p))
+    with pytest.raises(EindexError):
+        eindex(_rn(4, 5, 6, 6), _ri(6, (4, 5)), _ri(6, (4, 9)), p)
+
+
+def test_generic_path_torch_compile_clean():
+    lp, l1, l2 = _rn(4, 5, 6, 6), _ri(6, (4, 5)), _ri(6, (4, 5))
+    g = compile_eindex("batch seq [batch seq] [batch seq]")
+    assert torch.equal(torch.compile(g, fullgraph=True)(lp, l1, l2), g(lp, l1, l2))
+    jac = _rn(2, 3, 7, 2, 3, 7); oi, ii = _ri(7, (2, 3, 5)), _ri(7, (2, 3, 5))
+    h = compile_eindex("b s [b s k2] b s [b s k1] -> b s k2 k1")
+    assert torch.equal(torch.compile(h, fullgraph=True)(jac, oi, ii), h(jac, oi, ii))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_generic_path_cuda_matches_cpu():
+    p = "batch seq [batch seq 0] [batch seq 1]"
+    lp, lab = _rn(4, 5, 6, 6), _ri(6, (4, 5, 2))
+    cpu = eindex(lp, lab, p)
+    assert torch.equal(eindex(lp.cuda(), lab.cuda(), p).cpu(), cpu)
+    assert torch.equal(eindex(lp, lab, p), cpu)  # cpu plan still intact after the cuda call
