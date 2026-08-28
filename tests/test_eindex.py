@@ -218,7 +218,10 @@ def test_verbose():
 BAD_CALLS = {
     "array ndim mismatch": (lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 5)), "batch [batch seq]"), "3 dimensions"),
     "index ndim mismatch": (lambda: eindex(_rn(4, 5, 6), _ri(6, (4,)), "batch seq [batch seq]"), "Bracket #0"),
-    "contradictory sizes": (lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 7)), "batch seq [batch seq]"), "Incompatible sizes"),
+    "contradictory sizes": (
+        lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 7)), "batch seq [batch seq]"),
+        "Incompatible sizes",
+    ),
     "offset too large": (
         lambda: eindex(_rn(4, 5, 6), _ri(6, (4, 5)), "batch seq [batch seq+5]"),
         "too large",
@@ -309,6 +312,11 @@ def test_one_tensor_shared_across_brackets_like_original():
 def test_whitespace_in_pattern():
     lp, lab = _rn(8, 5, 9), _ri(9, (8, 5))
     ref = ref_eindex(lp, lab, "batch seq [batch seq]")
-    patterns = ["batch  seq [batch seq]", "batch\tseq [batch\tseq]", "  batch seq [batch seq]  ", "batch seq [ batch seq ]"]
+    patterns = [
+        "batch  seq [batch seq]",
+        "batch\tseq [batch\tseq]",
+        "  batch seq [batch seq]  ",
+        "batch seq [ batch seq ]",
+    ]
     for p in patterns:
         assert _same(eindex(lp, lab, p), ref), repr(p)
