@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="eindex-callum",
-    version="0.2.0",
+    version="0.1.3",
     packages=find_packages(exclude=["tests", "tests.*", "bench"]),
     install_requires=["torch", "numpy"],
     extras_require={"test": ["pytest", "einops"]},  # einops: only for the vendored original used as the test oracle
