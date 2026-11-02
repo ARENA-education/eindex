@@ -256,8 +256,8 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
 
     # Fast path: one bracket, no integer slots, no verbose, and both the bare axes and the bracket's
     # names are exactly the output axes -> a plain torch.gather along the bracket axis. Offsets in the
-    # bracket ("[batch seq+1]") are handled by slicing views of `arr` / `idx` first, so this still
-    # costs one gather (this is the next-token-logprob pattern, which sits in training loops).
+    # bracket ("[batch seq+1]") are handled by slicing the index first, so this still costs one gather,
+    # forwards and backwards (this is the next-token-logprob pattern, which sits in training loops).
     bare_offsets_zero = all(tok[2] == 0 for tok in axis_tokens if tok[0] == "bare")
     if (
         n_brackets == 1
@@ -268,24 +268,24 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
         and [e[0] for e in axis_tokens[idx_axes[0]][1]] == out_axes
     ):
         gather_dim = idx_axes[0]
-        # arr: shrink each bare axis whose name carries an offset (slice 0 : size-m); idx: slice each
-        # axis `off : off-m` (None when off == m). Built once here; `slice(0, None)` is a no-op view.
-        arr_sl = tuple(
-            slice(0, -offset_size[tok[1]] if tok[0] == "bare" and offset_size.get(tok[1], 0) else None)
-            for tok in axis_tokens
-        )
+        # idx: slice each axis `off : off-m` (None when off == m), so its axes have the output's lengths
+        # (size-m for an axis whose name carries an offset). Built once here.
         idx_sl = tuple(
             slice(off, (off - offset_size[name]) if off != offset_size[name] else None)
             for name, off, _d in axis_tokens[gather_dim][1]
         )
         if not has_offset:
-            arr_sl = idx_sl = None
+            idx_sl = None
 
         def _gather(arr: Tensor, idx: Tensor) -> Tensor:
             if idx.device != arr.device:  # advanced indexing (the original) accepts a CPU index on a CUDA array
                 idx = idx.to(arr.device)  # gather does not; keep that behaviour (no-op when they already match)
-            if arr_sl is not None:
-                arr, idx = arr[arr_sl], idx[idx_sl]
+            if idx_sl is not None:
+                # Slice only the index, not `arr`: the output keeps the first size-m positions of each offset
+                # axis, and torch.gather only needs index.size(d) <= input.size(d) for d != gather_dim, so
+                # gathering from the whole `arr` gives the same result. Slicing `arr` too would add a
+                # SliceBackward0 that zero-fills and copies an `arr`-sized gradient in the backward pass.
+                idx = idx[idx_sl]
             return arr.gather(gather_dim, idx.unsqueeze(gather_dim)).squeeze(gather_dim)
 
         if validate:
