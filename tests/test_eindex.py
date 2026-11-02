@@ -85,6 +85,44 @@ def test_example5_offset():
     assert _same(out, eindex(lp[:, :-1], tok[:, 1:], "batch seq [batch seq]"))
 
 
+
+@pytest.mark.parametrize(
+    "pattern, arr_shape, idx_shape, manual",
+    [
+        ("batch seq [batch seq+1]", (6, 9, 13), (6, 9), lambda a, i: a[:, :-1].gather(2, i[:, 1:, None]).squeeze(2)),
+        ("batch seq [batch seq+2]", (6, 9, 13), (6, 9), lambda a, i: a[:, :-2].gather(2, i[:, 2:, None]).squeeze(2)),
+        ("seq batch [seq+1 batch]", (9, 6, 13), (9, 6), lambda a, i: a[:-1].gather(2, i[1:, :, None]).squeeze(2)),
+    ],
+)
+def test_offset_gradients_match_manual_slice(pattern, arr_shape, idx_shape, manual):
+    """Offsets must give the same values *and gradients* as slicing by hand (the gradient is zero on the
+    positions the offset drops)."""
+    a1 = _rn(*arr_shape).requires_grad_(True)
+    a2 = a1.detach().clone().requires_grad_(True)
+    idx = _ri(arr_shape[-1], idx_shape)
+    w = _rn(*manual(a1.detach(), idx).shape)  # a non-uniform upstream gradient
+    out1, out2 = eindex(a1, idx, pattern), manual(a2, idx)
+    assert torch.equal(out1, out2)
+    (out1 * w).sum().backward()
+    (out2 * w).sum().backward()
+    assert torch.equal(a1.grad, a2.grad)
+
+
+def test_offset_backward_does_not_slice_arr():
+    """The offset fast path slices only the index, so the backward pass scatters straight into an
+    `arr`-sized gradient: no SliceBackward0 on `arr` (which would zero-fill and copy a whole extra
+    `arr`-sized tensor -- e.g. ~1.8 ms on [8, 401, 152k] fp32 log-probs on an RTX 5090)."""
+    arr = _rn(4, 7, 11).requires_grad_(True)
+    out = eindex(arr, _ri(11, (4, 7)), "batch seq [batch seq+1]")
+    seen, stack = set(), [out.grad_fn]
+    while stack:
+        fn = stack.pop()
+        if fn is None or fn in seen:
+            continue
+        seen.add(fn)
+        stack.extend(next_fn for next_fn, _ in fn.next_functions)
+    assert "SliceBackward0" not in {type(fn).__name__ for fn in seen}
+
 def test_numpy_io():
     lp = np.random.randn(8, 5, 20).astype(np.float32)
     lab = np.random.randint(0, 20, (8, 5))
