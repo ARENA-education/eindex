@@ -18,7 +18,7 @@ import torch
 from reference import eindex as ref_eindex  # the original (tests/reference, see conftest.py)
 
 from eindex import EindexError, compile_eindex, eindex
-from eindex.indexing import _compiled
+from eindex.indexing import _CACHE
 
 G = torch.Generator().manual_seed(0)
 
@@ -216,11 +216,12 @@ def test_gather_fast_path_matches_native():
 
 
 def test_pattern_cached():
-    _compiled.cache_clear()
+    _CACHE.clear()
     a, i = _ri(7, (4, 7)), _ri(7, (4,))
     eindex(a, i, "batch [batch]")
+    fn = _CACHE["batch [batch]"]
     eindex(a, i, "batch [batch]")
-    assert _compiled.cache_info().hits >= 1, "repeated pattern should hit the compile cache"
+    assert _CACHE["batch [batch]"] is fn and len(_CACHE) == 1, "repeated pattern should reuse the compiled closure"
 
 
 def test_torch_compile_clean():

@@ -7,7 +7,7 @@ batch size for several patterns. Prints a table and saves `bench/bench_eindex_{c
 
 Methods (per pattern, per size):
   - original eindex 0.1.1      : re-parses + re-validates the pattern on every call (tests/reference)
-  - eindex (drop-in, cached)   : this package's `eindex(...)`; compiled once per pattern, lru_cache'd
+  - eindex (drop-in, cached)   : this package's `eindex(...)`; compiled once per pattern, cached
   - compile_eindex closure     : the pre-compiled closure, called directly
   - native torch               : the best hand-written gather / advanced index
 """
