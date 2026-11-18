@@ -37,7 +37,6 @@ non-tuple path: ~450 us vs ~30 us for `gather`).
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Callable, Union
 
 import numpy as np
@@ -382,9 +381,16 @@ def compile_eindex(pattern: str, verbose: bool = False, validate: bool = True) -
     return _np_wrap(run)
 
 
-@lru_cache(maxsize=None)
+# A plain dict, not @lru_cache: cloudpickle can ship a registered module's functions and dicts by value, but always
+# pickles an lru_cache wrapper as an import, which fails on a server without eindex (e.g. NDIF remote traces)
+_CACHE: dict[str, Callable] = {}
+
+
 def _compiled(pattern: str) -> Callable:
-    return compile_eindex(pattern)
+    fn = _CACHE.get(pattern)
+    if fn is None:
+        fn = _CACHE[pattern] = compile_eindex(pattern)
+    return fn
 
 
 def eindex(*tensors_and_pattern, **kwargs) -> Array:
